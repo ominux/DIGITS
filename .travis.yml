@@ -24,7 +24,7 @@ install:
     - pip list
 
     # Torch
-    - ./scripts/travis/install-torch.sh $(pwd)/deps/torch
+    #- ./scripts/travis/install-torch.sh $(pwd)/deps/torch
 
     # DIGITS
     - sudo apt-get install graphviz
