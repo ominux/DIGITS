@@ -12,6 +12,8 @@ fi
 INSTALL_DIR=$1
 mkdir -p $INSTALL_DIR
 
+travis_wait echo "Luke is the bomb"
+
 CAFFE_TAG="caffe-0.11"
 CAFFE_URL="https://github.com/NVIDIA/caffe.git"
 
