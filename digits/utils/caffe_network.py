@@ -13,6 +13,9 @@ class Error(Exception):
 class ValidationError(Error):
     pass
 
+class RequiresForceError(Error):
+    pass
+
 class Network(object):
     """
     """
@@ -62,7 +65,7 @@ class Network(object):
         Sets layer.data_param.source for a Data layer
 
         Arguments:
-        phase -- TRAIN or TEST
+        phase -- train or val
         tops -- list of outputs for this layer
         filename -- location of the db
 
@@ -70,8 +73,68 @@ class Network(object):
         force -- if False, only change the data_param.source
             if True, create the layer and delete other layers if necessary
         """
-        #XXX: here
-        pass
+        old_data_layers = [(i,l) for i,l in enumerate(self._network.layer)
+                if Network._is_data_layer(l) and self._layer_in_phase(l, phase)]
+
+        needs_new_layer = False
+
+        # no layer exists
+        if len(old_data_layers) == 0:
+            needs_new_layer = True
+
+        # one layer found
+        elif len(old_data_layers) == 1:
+            old_layer_index, old_layer = old_data_layers[0]
+
+            needs_delete = False
+
+            # check layer.type
+            if old_layer.type != 'Data':
+                if not force:
+                    raise RequiresForceError('data layer is type "%s"' % old_layer.type)
+                needs_delete = True
+            else:
+                # check layer.top
+                if len(old_layer.top) != len(tops):
+                    if not force:
+                        raise RequiresForceError('data layer has too many tops')
+                    needs_delete = True
+                else:
+                    for old_top, new_top in zip(old_layer.top, tops):
+                        if old_top != new_top:
+                            if not force:
+                                raise RequiresForceError('tops do not match (%s vs %s)' % (old_top, new_top))
+                            needs_delete = True
+                            break
+
+            # delete the layer
+            if needs_delete:
+                print 'Deleting layer name="%s", type="%s", top="%s"' % (
+                        old_layer.name, old_layer.type, old_layer.top)
+                del self._network.layer[old_layer_index]
+                needs_new_layer = True
+
+        # multiple layers
+        elif len(old_data_layers) > 1:
+            if not force:
+                raise RequiresForceError('multiple data layers found')
+            for old_layer_index, old_layer in old_data_layers:
+                print 'Deleting layer name="%s", type="%s", top="%s"' % (
+                        old_layer.name, old_layer.type, old_layer.top)
+                del self._network.layer[old_layer_index]
+                needs_new_layer = True
+
+        if needs_new_layer:
+            data_layer = caffe_pb2.LayerParameter(
+                    name=','.join(tops),
+                    type='Data',
+                    )
+            for top in tops:
+                data_layer.top.append(top)
+            self._set_layer_phases(data_layer, phase)
+            data_layer.data_param.source = filename
+            self._insert_layer_front(self._network, data_layer)
+
 
     ### Functions for retrieving the train/val/deploy network
 
@@ -82,16 +145,11 @@ class Network(object):
         """
         train_network = caffe_pb2.NetParameter()
         for layer in self._network.layer:
-            # skip layers marked for deploy
-            if layer.name.startswith('deploy_'):
-                continue
-            # skip layers not in TRAIN phase
-            if not self._layer_in_phase(layer, caffe_pb2.TRAIN):
+            # skip layers not in train phase
+            if not self._layer_in_phase(layer, 'train'):
                 continue
             train_network.layer.add().CopyFrom(layer)
-            # remove prefix if set
-            if layer.name.startswith('train_'):
-                train_network.layer[-1].name = layer.name[6:]
+            self._cleanup_layer_name(train_network.layer[-1])
         return train_network
 
     @requires_load
@@ -101,16 +159,11 @@ class Network(object):
         """
         val_network = caffe_pb2.NetParameter()
         for layer in self._network.layer:
-            # skip layers marked for deploy
-            if layer.name.startswith('deploy_'):
-                continue
-            # skip layers not in TEST phase
-            if not self._layer_in_phase(layer, caffe_pb2.TEST):
+            # skip layers not in val phase
+            if not self._layer_in_phase(layer, 'val'):
                 continue
             val_network.layer.add().CopyFrom(layer)
-            # remove prefix if set
-            if layer.name.startswith('train_'):
-                val_network.layer[-1].name = layer.name[6:]
+            self._cleanup_layer_name(val_network.layer[-1])
         return val_network
 
     @requires_load
@@ -120,13 +173,12 @@ class Network(object):
         """
         trainval_network = caffe_pb2.NetParameter()
         for layer in self._network.layer:
-            # skip layers marked for deploy
-            if layer.name.startswith('deploy_'):
+            # skip layers not in train or val phase
+            if not self._layer_in_phase(layer, 'train') and \
+                    not self._layer_in_phase(layer, 'val'):
                 continue
             trainval_network.layer.add().CopyFrom(layer)
-            # remove prefix if set
-            if layer.name.startswith('train_'):
-                trainval_network.layer[-1].name = layer.name[6:]
+            self._cleanup_layer_name(trainval_network.layer[-1])
         return trainval_network
 
     @requires_load
@@ -136,16 +188,11 @@ class Network(object):
         """
         deploy_network = caffe_pb2.NetParameter()
         for layer in self._network.layer:
-            # skip layers marked for train
-            if layer.name.startswith('train_'):
-                continue
-            # skip layers not in TEST phase
-            if not self._layer_in_phase(layer, caffe_pb2.TEST):
+            # skip layers not in deploy phase
+            if not self._layer_in_phase(layer, 'deploy'):
                 continue
             deploy_network.layer.add().CopyFrom(layer)
-            # remove prefix if set
-            if layer.name.startswith('deploy_'):
-                deploy_network.layer[-1].name = layer.name[7:]
+            self._cleanup_layer_name(deploy_network.layer[-1])
         return deploy_network
 
 
@@ -184,9 +231,37 @@ class Network(object):
 
     ### Helper functions
 
-    def _layer_in_phase(self, layer, phase):
+    @staticmethod
+    def _is_data_layer(layer):
         """
-        Returns True if the layer is in the given phase
+        Returns True if the layer is a data layer
+        """
+        return 'data' in layer.type.lower()
+
+    @classmethod
+    def _layer_in_phase(cls, layer, phase):
+        """
+        Returns True if the layer is in the given phase (train/val/deploy)
+        """
+        if phase == 'train':
+            if layer.name.startswith('deploy_'):
+                return False
+            return cls._layer_in_caffe_phase(layer, caffe_pb2.TRAIN)
+        elif phase == 'val':
+            if layer.name.startswith('deploy_'):
+                return False
+            return cls._layer_in_caffe_phase(layer, caffe_pb2.TEST)
+        elif phase == 'deploy':
+            if layer.name.startswith('train_'):
+                return False
+            return cls._layer_in_caffe_phase(layer, caffe_pb2.TEST)
+        else:
+            raise ValueError('invalid phase')
+
+    @staticmethod
+    def _layer_in_caffe_phase(layer, phase):
+        """
+        Returns True if the layer is in the given phase (TRAIN/TEST)
         """
         if layer.include:
             return phase in [rule.phase for rule in layer.include]
@@ -194,7 +269,60 @@ class Network(object):
             return phase not in [rule.phase for rule in layer.exclude]
         return True
 
-    def _bottoms(self, network):
+    @classmethod
+    def _set_layer_phases(cls, layer, phases):
+        """
+        Sets the layer to only be included in the given phases
+        Options: all,train,trainval,val,deploy
+        """
+        # include in all
+        cls._cleanup_layer_name(layer)
+        layer.ClearField('exclude')
+        layer.ClearField('include')
+
+        if phases == 'all':
+            return
+        elif phases == 'trainval':
+            if not cls._is_data_layer(layer):
+                layer.name = 'train_%s' % layer.name
+        elif phases == 'train':
+            if not cls._is_data_layer(layer):
+                layer.name = 'train_%s' % layer.name
+            layer.include.add(phase = caffe_pb2.TRAIN)
+        elif phases == 'val':
+            if not cls._is_data_layer(layer):
+                layer.name = 'train_%s' % layer.name
+            layer.include.add(phase = caffe_pb2.TEST)
+        elif phases == 'deploy':
+            if cls._is_data_layer(layer):
+                raise ValueError("can't add data layer to deploy network")
+            layer.name = 'deploy_%s' % layer.name
+        else:
+            raise ValueError('invalid phases')
+
+    @staticmethod
+    def _cleanup_layer_name(layer):
+        """
+        Remove prefix from layer name if exists
+        """
+        if layer.name.startswith('train_'):
+            layer.name = layer.name[6:]
+        if layer.name.startswith('deploy_'):
+            layer.name = layer.name[7:]
+
+    @staticmethod
+    def _insert_layer_front(network, layer):
+        """
+        Add a layer to the front of the network
+        """
+        old_layers = [l for l in network.layer]
+        network.ClearField('layer')
+        network.layer.add().CopyFrom(layer)
+        for l in old_layers:
+            network.layer.add().CopyFrom(l)
+
+    @staticmethod
+    def _bottoms(network):
         """
         Returns a unique list of bottoms for the network
         """
@@ -204,7 +332,8 @@ class Network(object):
                 bottoms.add(bottom)
         return bottoms
 
-    def _tops(self, network):
+    @staticmethod
+    def _tops(network):
         """
         Returns a unique list of tops for the network
         """
